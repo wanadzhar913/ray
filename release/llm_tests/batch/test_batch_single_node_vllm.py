@@ -10,16 +10,20 @@ import os
 import re
 import sys
 import time
+from time import perf_counter
+from typing import Iterator
 
 import pytest
 import requests
 
 import ray
+from ray.data._internal.stats import DatasetStatsSummary, OperatorStatsSummary
 from ray.llm._internal.batch.benchmark.dataset import ShareGPTDataset
 from ray.llm._internal.batch.benchmark.benchmark_processor import (
+    BenchmarkResult,
     Mode,
     VLLM_SAMPLING_PARAMS,
-    benchmark,
+    build_single_vllm_engine_processor,
 )
 
 
@@ -89,6 +93,8 @@ def _get_prometheus_metric_snapshot(
 
         node_addr = node.get("NodeManagerAddress", "127.0.0.1")
         response = None
+        last_error = None
+
         for addr in _metrics_scrape_addresses(node_addr):
             try:
                 candidate = requests.get(
@@ -196,14 +202,97 @@ def _build_engine_metrics(
     }
 
 
+def _iter_operators(
+    stats_summary: DatasetStatsSummary,
+) -> Iterator[OperatorStatsSummary]:
+    for operator in stats_summary.operators_stats:
+        yield operator
+    for parent in stats_summary.parents:
+        yield from _iter_operators(parent)
+
+
+def _find_vllm_engine_operator(
+    stats_summary: DatasetStatsSummary,
+) -> OperatorStatsSummary | None:
+    for operator in _iter_operators(stats_summary):
+        if "vLLMEngine" in operator.operator_name:
+            return operator
+
+    available = [op.operator_name for op in _iter_operators(stats_summary)]
+    print(
+        "Warning: no vLLM engine operator found in Ray Data dataset stats. "
+        f"Available operators: {available}"
+    )
+    return None
+
+
+def _task_time_stats(operator: OperatorStatsSummary):
+    """Return per-task wall-time stats for the vLLM map_batches stage.
+
+    Prefer wall_time over udf_time: udf_time.min can be spuriously near-zero
+    for individual blocks even when batch wall times are hundreds of ms.
+    """
+    return operator.wall_time
+
+
+def _steady_state_task_latency_s(
+    operator: OperatorStatsSummary,
+) -> float | None:
+    """Minimum observed map_batches task latency for the vLLM stage.
+
+    With continuous batching, a single batch's wall time is comparable to
+    vLLM per-request E2E latency. The minimum task duration excludes
+    warmup-inflated tasks and overlapping-batch artifacts in the mean.
+    """
+    time_stats = _task_time_stats(operator)
+    if time_stats is None or time_stats.count <= 0:
+        return None
+    return float(time_stats.min)
+
+
+def _build_ray_data_metrics(
+    stats_summary: DatasetStatsSummary,
+) -> dict[str, float | str | int | None]:
+    operator = _find_vllm_engine_operator(stats_summary)
+    if operator is None:
+        return {
+            "vllm_stage_operator": None,
+            "mean_request_latency_s": None,
+            "min_task_latency_s": None,
+            "mean_task_latency_s": None,
+            "max_task_latency_s": None,
+            "wall_time_s": None,
+            "task_count": None,
+            "output_rows": None,
+        }
+
+    time_stats = _task_time_stats(operator)
+    mean_request_latency_s = _steady_state_task_latency_s(operator)
+
+    return {
+        "vllm_stage_operator": operator.operator_name,
+        "mean_request_latency_s": mean_request_latency_s,
+        "min_task_latency_s": mean_request_latency_s,
+        "mean_task_latency_s": float(time_stats.mean) if time_stats else None,
+        "max_task_latency_s": float(time_stats.max) if time_stats else None,
+        "wall_time_s": float(time_stats.sum) if time_stats else None,
+        "task_count": int(time_stats.count) if time_stats else None,
+        "output_rows": (
+            int(operator.output_num_rows.sum) if operator.output_num_rows else None
+        ),
+    }
+
+
 def _build_job_metrics(
-    result, samples: int, engine_metrics: dict[str, float | None]
+    result,
+    samples: int,
+    engine_metrics: dict[str, float | None],
+    mean_request_latency_s: float | None,
 ) -> dict:
-    avg_job_latency_s = result.elapsed_s / samples if samples > 0 else None
     engine_e2e_s = engine_metrics.get("mean_e2e_latency_s")
     ray_data_overhead_per_req_s = (
-        max(0.0, avg_job_latency_s - engine_e2e_s)
-        if avg_job_latency_s is not None and engine_e2e_s is not None
+        max(0.0, mean_request_latency_s - engine_e2e_s)
+        if mean_request_latency_s is not None and engine_e2e_s is not None
         else None
     )
 
@@ -211,7 +300,7 @@ def _build_job_metrics(
         "samples": int(samples),
         "elapsed_s": float(result.elapsed_s),
         "throughput_req_per_s": float(result.throughput),
-        "avg_job_latency_s": avg_job_latency_s,
+        "mean_request_latency_s": mean_request_latency_s,
         "engine_mean_e2e_latency_s": engine_e2e_s,
         "estimated_ray_data_overhead_per_req_s": ray_data_overhead_per_req_s,
     }
@@ -269,10 +358,7 @@ def test_single_node_baseline_benchmark():
     }
     before_snapshot = _get_prometheus_metric_snapshot(metric_names)
 
-    # Use benchmark processor to run a single-node vLLM benchmark
-    result = benchmark(
-        Mode.VLLM_ENGINE,
-        ds,
+    processor = build_single_vllm_engine_processor(
         batch_size=BATCH_SIZE,
         concurrency=CONCURRENCY,
         model=MODEL_ID,
@@ -280,6 +366,20 @@ def test_single_node_baseline_benchmark():
         pipeline_parallel_size=1,
         tensor_parallel_size=1,
     )
+    start = perf_counter()
+    output_ds = processor(ds).materialize()
+    elapsed_s = perf_counter() - start
+
+    result = BenchmarkResult(
+        mode=Mode.VLLM_ENGINE,
+        batch_size=BATCH_SIZE,
+        concurrency=CONCURRENCY,
+        samples=len(prompts),
+        elapsed_s=elapsed_s,
+    )
+    ray_data_metrics = _build_ray_data_metrics(output_ds.get_stats_summary())
+    mean_request_latency_s = ray_data_metrics["mean_request_latency_s"]
+
     time.sleep(2)
     after_snapshot = _get_prometheus_metric_snapshot(metric_names)
     if not any(after_snapshot.values()):
@@ -295,7 +395,9 @@ def test_single_node_baseline_benchmark():
         elapsed_s=result.elapsed_s,
         model_id=MODEL_ID,
     )
-    job_metrics = _build_job_metrics(result, len(prompts), engine_metrics)
+    job_metrics = _build_job_metrics(
+        result, len(prompts), engine_metrics, mean_request_latency_s
+    )
 
     result.show()
 
@@ -320,13 +422,17 @@ def test_single_node_baseline_benchmark():
         engine_metrics["total_token_throughput_tok_per_s"],
     )
     print(
+        "RAY_DATA_MEAN_REQUEST_LATENCY_S:",
+        job_metrics["mean_request_latency_s"],
+    )
+    print(
         "ESTIMATED_RAY_DATA_OVERHEAD_PER_REQUEST_S:",
         job_metrics["estimated_ray_data_overhead_per_req_s"],
     )
     print("=" * 60)
 
     # Optional thresholds to fail on regressions
-    min_throughput = _get_float_env("RAY_DATA_LLM_BENCHMARK_MIN_THROUGHPUT", 4)
+    min_throughput = _get_float_env("RAY_DATA_LLM_BENCHMARK_MIN_THROUGHPUT", 5)
     max_latency_s = _get_float_env("RAY_DATA_LLM_BENCHMARK_MAX_LATENCY_S", 150)
     if min_throughput is not None:
         assert (
@@ -349,6 +455,7 @@ def test_single_node_baseline_benchmark():
             "elapsed_s": float(result.elapsed_s),
             "job_metrics": job_metrics,
             "engine_metrics": engine_metrics,
+            "ray_data_metrics": ray_data_metrics,
         }
         try:
             artifact_dir = os.path.dirname(artifact_path)
